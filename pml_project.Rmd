@@ -1,0 +1,139 @@
+---
+title: "Practical machine learning assignment"
+output: html_document
+---
+
+# Executive summary
+
+In this assignment we look at data from from activity trackers with the aim of trying to predict which exercise (A to E) the user is performing. The data used in this project is from: http://groupware.les.inf.puc-rio.br/har. After tidying up the data and peforming cross validation, we can with pretty high confidence say that we achieve a predticiton rate above 99% with best performing algorithm (random forest).
+
+# Import libraries and data
+
+```{r load, warning=FALSE, message=FALSE}
+library(caret); library(dplyr); library(randomForest); library(knitr)
+training <- read.csv("pml-training.csv")
+testing <- read.csv("pml-testing.csv")
+```
+
+# Clean data
+Remove variables (columns) with high proportions of NA, empty cells (""). Also remove variables that have no value as predictors (id, time stamps etc.)
+
+```{r}
+na_count <- sapply(training, function(y) sum(length(which(is.na(y)))))
+empty_count <- sapply(training, function(y) sum(length(which(y == ""))))
+training <- training[ , na_count<19000 & empty_count<19000]
+training <- select(training, -(X:num_window)) # Remove X, user_name, 3 time stamps, new_window, num_window
+```
+
+After cleaning there are 52 predictor variables in `training`. Remaining empty data cells and NA values will be imputed as default by the prediction model chosen. E.g., from the randomForest documentation on Values: "For numeric variables, NA s are replaced with column medians. For factor variables, NA s are replaced with the most frequent levels (breaking ties at random). If object contains no NAs, it is returned unaltered."
+
+# Split data for crossover validation
+
+There are only 20 cases in the the provided test data set, which are also the cases we want to accurately predict. Hence, we need to create a test partition from the training data to perform cross validation and measure classification errors.
+
+````{r}
+set.seed(1000)
+index <- createDataPartition(training$classe, p=0.7, list=F)
+train_cross <- training[index, ]
+valid_cross <- training[-index, ]
+```
+
+# Model selection
+
+In this chapter three different prediction algorithms will be compared: classification tree (`rpart`), random forest (`rf`) and boosted trees (`gbm`). The model with the lowest classification error(s) will chosen for the final model. Three out of sample error estimations will be used for model evaluation: Classificaton error, Gini index and Information gain/Deviation.
+
+K-folds, with K = 5, is the chosen cross validation method. This should be sufficient for crossover validation for this data set. The gbm calulations are also quite calculation intensive, which favours K=5 over K=10.
+
+```{r k-folds, echo=TRUE, warning=FALSE, cache=TRUE, message=FALSE, results=FALSE}
+folds <- createFolds(train_cross$classe, k = 5) # Create folds
+error_methods <- c("Classification error", "Gini index", "Information gain")
+error_df <- data.frame(row.names = error_methods) # Create data frame for storing error results
+methods <- c("rpart", "rf", "gbm") # Methods to be used
+gbmGrid <- expand.grid(interaction.depth=3, n.trees=400, shrinkage=0.1, n.minobsinnode=20) # setting parameters for gbm. These values provide quite good accuracy for this problem, but calculation time is long (several hours on my laptop).
+
+for (method in methods) {
+    ce <- 0
+    gini <- 0
+    info <- 0
+    
+    for (fold in folds) {
+        if (method == "rf") { #randomForest seems much faster than "rf" in caret, don't know why
+            set.seed(123)
+            model <- randomForest(classe ~ ., data=train_cross[-fold, ], importance=T, ntree=500)
+        } else if (method == "gbm") { # need if sentence because of parameters
+            set.seed(123)
+            model <- train(classe ~ ., data=train_cross[-fold, ], method=method, tuneGrid=gbmGrid)
+        } else {
+            set.seed(123)
+            model <- train(classe ~ ., data=train_cross[-fold, ], method = method)
+        }
+        
+        pred <- predict(model, train_cross[fold, ])
+        
+        # Calculate all p_hat values, to be able to calculate the error estimates
+        p_hat <- data.frame()
+        for (clas in levels(training$classe)) {
+            pred_class <- pred[train_cross[fold, ]$classe == clas]
+            train_class <- train_cross[fold, ]$classe
+            train_class <- train_class[train_class == clas]
+            
+            p_hat_mk <- c()
+            for (claz in levels(training$classe)) {
+                p_hat_mk <- c(p_hat_mk, sum(pred_class == claz)/length(train_class))
+            }
+            p_hat <- rbind(p_hat, p_hat_mk)
+        }
+        # Calculate the different error estimates and summing them together (for each fold)
+        ce <- ce + mean(1-sapply(p_hat, max))
+        gini <- gini + mean(1-rowSums(sapply(p_hat, function(y) y^2)))
+        info <- info + mean(rowSums(-sapply(p_hat, function(y) y*log2(y)), na.rm = T))
+    } 
+    # Dividing by number of folds for each error estimate to get average over all folds, and saving in data frame
+    error_df[, method] <- c(ce, gini, info) / length(folds) 
+}
+```
+
+```{r, echo=F}
+kable(error_df, digits = 4)
+```
+
+Conclusions from the table above:
+
+- Regression tree (rpart) does a pretty bad job at predicting for this problem, almost no better than guessing randomly.
+- It is quite tight between the random forest and the gradient boosted tree model. We can say that, unless extreme demands for accuracy are needed, both these models do a pretty good job at predicting outcomes in this problem.
+- However, the random forest is the best model, as can be seen on all three error measurements (especially on Information gain). Also taking into consideration that gbm is (much) more computationally intensive, it's an easy decision to go further with the random forest algorithm.
+
+# Final model generation
+
+Now we will train the chosen algorithm, random forest, on the entire training set, and then test algorithm performance on the validation set created.
+
+````{r final, echo=TRUE, warning=FALSE, cache=TRUE, message=FALSE}
+model_rf <- randomForest(classe ~ ., data=train_cross, importance=T, ntree=500)
+plot(model_rf)
+```
+
+We can see from the figures above that we didn't actually have to simulate that many trees with random forest (500) to get high prediction accuracy for this problem - it seems to converging at around 100 trees.
+
+```{r}
+varImpPlot(model_rf)
+```
+
+The most important variables in predicting with a random forest can be seen in the figure above. `vaw_belt` and `roll_belt` are the two most important variables.
+
+# Validation set prediction performance
+
+Test the final model on the cross validation set, and check the confusion matrix.
+
+```{r}
+pred <- predict(model_rf, valid_cross)
+confusionMatrix(pred, valid_cross$classe)
+```
+
+The final modal has an estimated out of sample accuracy of 99.46%, with the entire 95% confidence interval over 99%.
+
+Finally, we make the predictions on the testing set for the prediction submission.
+
+```{r}
+predict(model_rf, testing)
+```
+
